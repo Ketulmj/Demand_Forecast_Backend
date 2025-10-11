@@ -1,52 +1,70 @@
-from sqlalchemy.orm import Session
-import models, schemas
+from typing import Optional
+from db import get_db
 from security import get_password_hash
 import secrets
+import asyncio
 
-def get_user(db: Session, user_id: int):
-    return db.query(models.User).filter(models.User.id == user_id).first()
+USERS = 'users'
+UPLOADS = 'uploads'
 
-def get_user_by_email(db: Session, email: str):
-    return db.query(models.User).filter(models.User.email == email).first()
+# Utility to create a MongoDB user programmatically
+async def create_mongo_user(db, username: str, password: str, dbname: str):
+    """
+    Create a MongoDB user with readWrite role for the specified database.
+    Usage:
+        await create_mongo_user(db, "mongo", "example", "forecast_mongo")
+    """
+    try:
+        result = await db.command(
+            "createUser",
+            username,
+            pwd=password,
+            roles=[{"role": "readWrite", "db": dbname}]
+        )
+        return result
+    except Exception as e:
+        return {"error": str(e)}
 
-def get_users(db: Session, skip: int = 0, limit: int = 100):
-    return db.query(models.User).offset(skip).limit(limit).all()
+async def get_user(db, user_id: int) -> Optional[dict]:
+    return await db[USERS].find_one({"_id": user_id})
 
-def create_user(db: Session, user: schemas.UserCreate):
-    hashed_password = get_password_hash(user.password)
+async def get_user_by_email(db, email: str) -> Optional[dict]:
+    print("Fetching user by email:", email)
+    collections = await db.list_collection_names()
+    print("Collections:", collections)
+    return await db[USERS].find_one({"email": email})
+
+async def create_user(db, user) -> dict:
+    # hashed_password = get_password_hash(user.password)
     verification_token = secrets.token_urlsafe(32)
-    db_user = models.User(
-        username=user.username,
-        email=user.email,
-        password=hashed_password,
-        email_verification_token=verification_token
-    )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    doc = {
+        "username": user.username,
+        "email": user.email,
+        "password": user.password,
+        "is_email_verified": False,
+        "email_verification_token": verification_token,
+    }
+    print("Doc : ",doc)
+    result = await db[USERS].insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc
 
-def get_user_by_email_verification_token(db: Session, token: str):
-    return db.query(models.User).filter(models.User.email_verification_token == token).first()
+async def get_user_by_email_verification_token(db, token: str) -> Optional[dict]:
+    return await db[USERS].find_one({"email_verification_token": token})
 
-def verify_user_email(db: Session, user: models.User):
-    user.is_email_verified = True
-    user.email_verification_token = None
-    db.commit()
-    db.refresh(user)
-    return user
+async def verify_user_email(db, user: dict) -> dict:
+    await db[USERS].update_one({"_id": user["_id"]}, {"$set": {"is_email_verified": True, "email_verification_token": None}})
+    return await get_user_by_email(db, user.get("email"))
 
-
-def create_upload(db: Session, upload: schemas.UploadCreate):
-    db_upload = models.Upload(
-        user_id=upload.user_id,
-        filename=upload.filename,
-        key=upload.key,
-        bucket=upload.bucket,
-        size_bytes=upload.size_bytes,
-        content_type=upload.content_type
-    )
-    db.add(db_upload)
-    db.commit()
-    db.refresh(db_upload)
-    return db_upload
+async def create_upload(db, upload) -> dict:
+    doc = {
+        "user_id": upload.user_id,
+        "filename": upload.filename,
+        "key": upload.key,
+        "bucket": upload.bucket,
+        "size_bytes": upload.size_bytes,
+        "content_type": upload.content_type,
+    }
+    result = await db[UPLOADS].insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc

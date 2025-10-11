@@ -9,7 +9,7 @@ class UserCreate(UserBase):
     password: str
 
 class User(UserBase):
-    id: int
+    id: str
     is_email_verified: bool
 
     class Config:
@@ -37,7 +37,7 @@ class UploadCreate(UploadBase):
     user_id: int
 
 class UploadCompleteRequest(BaseModel):
-    upload_id: int
+    upload_id: str
     s3_key: str
 
 class TrainResponse(BaseModel):

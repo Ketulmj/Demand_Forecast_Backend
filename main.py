@@ -1,11 +1,6 @@
 from fastapi import FastAPI
-from db import engine
-import models
 from fastapi.middleware.cors import CORSMiddleware
 from routes import users, uploads, train
-
-# models.Base.metadata.drop_all(bind=engine) # to drop all tables in db
-models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 

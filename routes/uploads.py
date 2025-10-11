@@ -1,12 +1,13 @@
 import uuid
 import boto3
-from fastapi import APIRouter, Depends, File, HTTPException, Query,UploadFile
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from botocore.exceptions import ClientError
+from bson.objectid import ObjectId
+
 from db import get_db
 from settings import settings
-from models import Upload
-from schemas import UploadCompleteRequest
+from schemas import UploadCompleteRequest, User
+from auth import get_current_active_user
 
 router = APIRouter()
 
@@ -17,14 +18,20 @@ s3 = boto3.client(
     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
 )
 
-# set filename according to userid
-def make_s3_key(filename: str) -> str:
+UPLOADS_COLLECTION = 'uploads'
+
+def make_s3_key(user_id: str, filename: str) -> str:
     ext = filename.split(".")[-1].lower() if "." in filename else "csv"
-    return f"uploads/{uuid.uuid4().hex}.{ext}"
+    return f"uploads/{user_id}/{uuid.uuid4().hex}.{ext}"
 
 @router.post("/csv-for-training")
-async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    key = make_s3_key(file.filename)
+async def upload_file(
+    file: UploadFile = File(...), 
+    db = Depends(get_db), 
+    current_user: User = Depends(get_current_active_user)
+):
+    user_id = str(current_user.get('_id'))
+    key = make_s3_key(user_id, file.filename)
     bucket_name = settings.S3_BUCKET_NAME
 
     try:
@@ -34,46 +41,42 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db
             Key=key,
             ExtraArgs={"ContentType": file.content_type or "application/octet-stream"},
         )
-
-        print("Upload successful!")
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
 
     head = s3.head_object(Bucket=bucket_name, Key=key)
     size = head.get("ContentLength")
 
-
-    # --- inserting s3 metadata into db ---
-    row = Upload(
-        filename=file.filename,
-        key=key,
-        bucket=bucket_name,
-        size_bytes=size,
-        content_type=file.content_type or "application/octet-stream",
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+    upload_doc = {
+        "user_id": user_id,
+        "filename": file.filename,
+        "key": key,
+        "bucket": bucket_name,
+        "size_bytes": size,
+        "content_type": file.content_type or "application/octet-stream",
+    }
+    result = await db[UPLOADS_COLLECTION].insert_one(upload_doc)
+    inserted_id = result.inserted_id
 
     return {
-        "id": row.id,
-        "filename": row.filename,
-        "s3_key": row.key,
-        "bucket": row.bucket,
-        "size_bytes": row.size_bytes,
-        "content_type": row.content_type,
+        "id": str(inserted_id),
+        "filename": upload_doc["filename"],
+        "s3_key": upload_doc["key"],
+        "bucket": upload_doc["bucket"],
+        "size_bytes": upload_doc["size_bytes"],
+        "content_type": upload_doc["content_type"],
     }
 
-
-# generate a presigned GET URL of csv file
 @router.get("/generate-upload-url")
-def generate_presigned_upload_url(
+async def generate_presigned_upload_url(
     filename: str = Query(...),
     content_type: str = Query("text/csv"),
-    db: Session = Depends(get_db)
+    db = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
+    user_id = str(current_user.get('_id'))
     bucket_name = settings.S3_BUCKET_NAME
-    key = make_s3_key(filename)
+    key = make_s3_key(user_id, filename)
 
     try:
         presigned_url = s3.generate_presigned_url(
@@ -88,45 +91,71 @@ def generate_presigned_upload_url(
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
 
-    # Optionally create a DB record
-    row = Upload(
-        filename=filename,
-        key=key,
-        bucket=bucket_name,
-        size_bytes=0,
-        content_type=content_type,
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+    upload_doc = {
+        "user_id": user_id,
+        "filename": filename,
+        "key": key,
+        "bucket": bucket_name,
+        "size_bytes": 0, # Will be updated on completion
+        "content_type": content_type,
+    }
+    result = await db[UPLOADS_COLLECTION].insert_one(upload_doc)
+    inserted_id = result.inserted_id
 
     return {
         "upload_url": presigned_url,
         "key": key,
-        "upload_id": row.id
+        "upload_id": str(inserted_id)
     }
 
-
 @router.post("/upload-complete")
-def confirm_upload(request: UploadCompleteRequest, db: Session = Depends(get_db)):
-    print(request.upload_id)
-    upload = db.get(Upload, request.upload_id)
+async def confirm_upload(
+    request: UploadCompleteRequest, 
+    db = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    user_id = str(current_user.get('_id'))
+    try:
+        upload_id = ObjectId(request.upload_id)
+    except Exception:
+        raise HTTPException(400, "Invalid upload_id format")
+
+    upload = await db[UPLOADS_COLLECTION].find_one({"_id": upload_id, "user_id": user_id})
     if not upload:
-        raise HTTPException(404, "Not found")
-    head = s3.head_object(Bucket=upload.bucket, Key=upload.key)
-    upload.size_bytes = head.get("ContentLength")
-    db.commit()
+        raise HTTPException(404, "Upload record not found or you don't have permission")
+
+    if upload.get('key') != request.s3_key:
+        raise HTTPException(400, "S3 key mismatch")
+
+    head = s3.head_object(Bucket=upload["bucket"], Key=upload["key"])
+    size = head.get("ContentLength")
+    
+    await db[UPLOADS_COLLECTION].update_one(
+        {"_id": upload_id},
+        {"$set": {"size_bytes": size}}
+    )
+    
     return {"status": "ok"}
 
-
 @router.get("/download/{upload_id}")
-def get_download_url(upload_id: int, db: Session = Depends(get_db)):
-    row = db.get(Upload, upload_id)
+async def get_download_url(
+    upload_id: str, 
+    db = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    user_id = str(current_user.get('_id'))
+    try:
+        obj_id = ObjectId(upload_id)
+    except Exception:
+        raise HTTPException(400, "Invalid upload_id format")
+
+    row = await db[UPLOADS_COLLECTION].find_one({"_id": obj_id, "user_id": user_id})
     if not row:
-        raise HTTPException(404, "Not found")
+        raise HTTPException(404, "Not found or you don't have permission")
+        
     url = s3.generate_presigned_url(
         ClientMethod="get_object",
-        Params={"Bucket": row.bucket, "Key": row.key},
+        Params={"Bucket": row["bucket"], "Key": row["key"]},
         ExpiresIn=300,  # 5 minutes
     )
     return {"url": url}
