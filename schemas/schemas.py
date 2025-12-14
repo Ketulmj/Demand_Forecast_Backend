@@ -80,8 +80,6 @@ class PredictRequest(BaseModel):
     product: str
     city: str
     num_days: int = Field(30, ge=1, le=365)  # validate reasonable horizon
-    price: Optional[float] = None
-    discount: Optional[float] = None
 
 class PredictionRecord(BaseModel):
     date: str
